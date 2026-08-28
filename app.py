@@ -3,6 +3,7 @@ import os
 import io
 import json
 import re
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -191,6 +192,64 @@ def get_client():
         return None
     return genai.Client(api_key=key)
 
+# Gemini reliability settings
+PRIMARY_GEMINI_MODEL = "gemini-3.6-flash"
+FALLBACK_GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_RETRY_DELAY_SECONDS = 4
+
+def _is_temporary_gemini_error(exc):
+    """Return True only for temporary overload/service-unavailable errors."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    status = str(getattr(exc, "status", "") or "").upper()
+    message = str(exc).upper()
+    return (
+        code == 503
+        or status in {"503", "UNAVAILABLE", "SERVICE_UNAVAILABLE"}
+        or "503 UNAVAILABLE" in message
+        or "SERVICE_UNAVAILABLE" in message
+        or "CURRENTLY EXPERIENCING HIGH DEMAND" in message
+    )
+
+def generate_gemini_content(client, *, contents, config, operation):
+    """Call the primary model, retry one temporary 503, then use a stable Lite fallback.
+
+    We deliberately do not retry 429 quota errors here because repeated requests
+    cannot solve a daily quota exhaustion problem and would waste demo credits.
+    """
+    last_error = None
+
+    for attempt in range(2):
+        try:
+            return client.models.generate_content(
+                model=PRIMARY_GEMINI_MODEL,
+                contents=contents,
+                config=config,
+            )
+        except Exception as exc:
+            last_error = exc
+            if not _is_temporary_gemini_error(exc) or attempt == 1:
+                break
+            time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+
+    # A 503 means temporary service capacity, not a bad prompt/key.
+    # Gemini 3.5 Flash-Lite is a stable multimodal model and supports structured
+    # outputs, so it is suitable for both extraction and explanation fallback.
+    if last_error is not None and _is_temporary_gemini_error(last_error):
+        try:
+            return client.models.generate_content(
+                model=FALLBACK_GEMINI_MODEL,
+                contents=contents,
+                config=config,
+            )
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"Gemini was temporarily unavailable during {operation}. "
+                f"Primary model error: {last_error}. Fallback model error: {fallback_error}"
+            ) from fallback_error
+
+    raise last_error
+
+
 def canonical_name(name: str) -> str:
     n = name.lower().strip()
     for canon, aliases in CANONICAL.items():
@@ -267,14 +326,15 @@ Only extract measurable test markers that have a numeric value. Preserve units a
     else:
         parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
 
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
+    response = generate_gemini_content(
+        client,
         contents=types.Content(role="user", parts=parts),
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_json_schema=schema,
             temperature=0.0,
         ),
+        operation="report extraction",
     )
     result = json.loads(response.text)
     clean = []
@@ -390,13 +450,14 @@ Safety rules:
 - Use neutral language such as "increased", "decreased", "changed", and "worth discussing with your clinician".
 - This is educational explanation, not medical advice.
 """
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
+    response = generate_gemini_content(
+        client,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             temperature=0.2,
         ),
+        operation="patient explanation",
     )
     return json.loads(response.text)
 
@@ -603,7 +664,19 @@ if uploaded_files:
                         st.error("We could not find enough common numeric markers across the uploaded reports. Try reports with overlapping tests, such as multiple CBC, HbA1c, thyroid or lipid reports.")
                     else:
                         st.write("Creating patient-friendly explanation...")
-                        explanation = call_gemini_explain(client, parsed, comparison, output_language) if client else local_explanation(comparison, output_language)
+                        if client:
+                            try:
+                                explanation = call_gemini_explain(client, parsed, comparison, output_language)
+                            except Exception as explanation_error:
+                                # Keep the core comparison usable even if the narrative
+                                # model is temporarily unavailable.
+                                explanation = local_explanation(comparison, output_language)
+                                st.warning(
+                                    "The comparison is ready, but AI wording was temporarily unavailable. "
+                                    "SwasthAI is showing its built-in patient-friendly explanation instead."
+                                )
+                        else:
+                            explanation = local_explanation(comparison, output_language)
                         status.update(label="Comparison ready", state="complete")
                         st.session_state.analysis = {
                             "reports": parsed,
@@ -740,10 +813,23 @@ if st.session_state.analysis:
     if selected_explanation_language != a.get("language", "English"):
         try:
             with st.spinner(f"Updating explanation to {selected_explanation_language}..."):
-                updated_explanation = (
-                    call_gemini_explain(client, reports, comparison, selected_explanation_language)
-                    if client else local_explanation(comparison, selected_explanation_language)
-                )
+                if client:
+                    try:
+                        updated_explanation = call_gemini_explain(
+                            client, reports, comparison, selected_explanation_language
+                        )
+                    except Exception:
+                        updated_explanation = local_explanation(
+                            comparison, selected_explanation_language
+                        )
+                        st.info(
+                            "AI wording was temporarily unavailable, so SwasthAI switched to its built-in "
+                            "patient-friendly explanation for this language."
+                        )
+                else:
+                    updated_explanation = local_explanation(
+                        comparison, selected_explanation_language
+                    )
             st.session_state.analysis["explanation"] = updated_explanation
             st.session_state.analysis["language"] = selected_explanation_language
             explanation = updated_explanation
