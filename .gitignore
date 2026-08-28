@@ -1,0 +1,17 @@
+# Virtual environment
+venv/
+.venv/
+
+# API keys and Streamlit secrets
+.streamlit/secrets.toml
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Streamlit
+.streamlit/config.toml
